@@ -10,12 +10,12 @@
 
 // ====================== Wi-Fi config ======================
 // Change Wi-Fi SSID and password here.
-const char* WIFI_SSID = "ciallo";
-const char* WIFI_PASS = "20060311";
+const char* WIFI_SSID = "你的WiFi";
+const char* WIFI_PASS = "你的密码";
 
 // ====================== AI parse service config ======================
-const char* AI_PARSE_URL = "http://192.168.137.1:5000/parse_text";
-const char* AI_VOICE_URL = "http://192.168.137.1:5000/voice";
+const char* AI_PARSE_URL = "http://电脑IP:5000/parse_text";
+const char* AI_VOICE_URL = "http://电脑IP:5000/voice";
 const unsigned long AI_HTTP_TIMEOUT_MS = 8000;
 const unsigned long VOICE_HTTP_TIMEOUT_MS = 60000;
 
