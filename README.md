@@ -150,27 +150,3 @@ AI/语音命令示例：
 关闭灯带
 ```
 
-控制命令由 Python 本地规则优先解析，不需要调用 DeepSeek。
-
-### 6. 提醒联动
-
-提醒进入 `ALERTING` 时，OLED、蜂鸣器、LED、MAX98357A 提示音保持原逻辑，同时灯板会亮起。按网页确认或 GPIO6 按键确认后，提醒结束，风扇和灯板关闭。
-
-## 上传 GitHub 前注意
-
-本仓库不应上传以下内容：
-
-- `transfer/.env`：包含真实 API Key
-- `transfer/.venv/`：本地虚拟环境
-- `transfer/models/`：本地 Whisper 模型缓存
-- `transfer/last_voice.wav`：调试录音
-- `*.log`、`__pycache__/` 等运行缓存
-
-这些已经写入 `.gitignore`。
-
-## 常见问题
-
-- Python 识别失败：先确认 `python app.py` 正常运行，再访问 `/health`。
-- DeepSeek 失败：检查 `.env` 中 `DEEPSEEK_API_KEY` 是否填写正确，VPN/TUN 模式可能影响直连。
-- 硬件麦克风全是噪声：检查 INMP441 的 SCK/WS/SD 是否接到 GPIO10/11/12，L/R 是否接 GND。
-- 风扇或灯板不动作：确认 LR7843 模块 `PWM/IN` 接对 GPIO，风扇/灯板供电 GND 与 ESP32 共地。
