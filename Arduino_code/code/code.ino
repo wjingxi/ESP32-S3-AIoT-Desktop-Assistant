@@ -6,16 +6,24 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
+#include <BH1750.h>
 #include <driver/i2s.h>
+#include <math.h>
+
+// Arduino Library Manager: install Adafruit AHTX0, Adafruit BMP280 Library,
+// BH1750, Adafruit Unified Sensor, Adafruit SSD1306 and Adafruit GFX.
 
 // ====================== Wi-Fi config ======================
 // Change Wi-Fi SSID and password here.
-const char* WIFI_SSID = "你的WiFi";
-const char* WIFI_PASS = "你的密码";
+const char* WIFI_SSID = "your wifi";
+const char* WIFI_PASS = "your password";
 
 // ====================== AI parse service config ======================
-const char* AI_PARSE_URL = "http://电脑IP:5000/parse_text";
-const char* AI_VOICE_URL = "http://电脑IP:5000/voice";
+const char* AI_PARSE_URL = "http://your IP/parse_text";
+const char* AI_VOICE_URL = "http://your IP/voice";
 const unsigned long AI_HTTP_TIMEOUT_MS = 8000;
 const unsigned long VOICE_HTTP_TIMEOUT_MS = 60000;
 
@@ -36,6 +44,10 @@ const int PIN_SPK_BCLK = 16;
 const int PIN_SPK_LRCLK = 17;
 const int PIN_SPK_DOUT = 18;
 
+// MP3-TF-16P / DFPlayer Mini serial pins. Do not change current wiring.
+const int PIN_MP3_TX = 47;  // ESP32 TX -> MP3 RX
+const int PIN_MP3_RX = 48;  // ESP32 RX <- MP3 TX
+
 #define FAN_PIN 13
 #define LAMP_PIN 14
 
@@ -43,8 +55,8 @@ const int PIN_SPK_DOUT = 18;
 const bool FAN_ACTIVE_HIGH = true;
 const bool LAMP_ACTIVE_HIGH = true;
 
-// Reserved RGB pin. Not used in this version.
-const int PIN_RGB_RESERVED = 48;
+// Reserved RGB pin. Not used in this version. GPIO48 is used by MP3 RX now.
+const int PIN_RGB_RESERVED = -1;
 
 // ====================== Level config ======================
 // GPIO15 HIGH means human detected. Change to LOW if the module is inverted.
@@ -109,6 +121,33 @@ String lastSpeakerResult = "Speaker not tested.";
 bool fanOn = false;
 bool lampOn = false;
 
+// ====================== Environment sensors ======================
+BH1750 lightMeter;
+Adafruit_AHTX0 aht;
+Adafruit_BMP280 bmp;
+
+bool bh1750OK = false;
+bool aht20OK = false;
+bool bmp280OK = false;
+
+float envTempC = NAN;
+float envHumidity = NAN;
+float envPressureHpa = NAN;
+float envLux = NAN;
+
+unsigned long lastEnvReadMs = 0;
+const unsigned long ENV_READ_INTERVAL_MS = 2000;
+
+bool autoEnvMode = false;
+
+const float FAN_ON_TEMP_C = 28.0;
+const float FAN_OFF_TEMP_C = 26.0;
+const float LAMP_ON_LUX = 80.0;
+const float LAMP_OFF_LUX = 150.0;
+
+unsigned long lastHumanAbsentMs = 0;
+const unsigned long AUTO_OFF_DELAY_MS = 10000;
+
 // ====================== millis timers ======================
 unsigned long lastSerialMs = 0;
 unsigned long lastOLEDMs = 0;
@@ -150,11 +189,31 @@ const i2s_port_t SPK_I2S_PORT = I2S_NUM_1;
 const int SPK_SAMPLE_RATE = 16000;
 const int SPK_TONE_AMPLITUDE = 5000;
 
+HardwareSerial mp3Serial(1);
+bool mp3OK = false;
+int mp3Volume = 20;
+int currentMp3Index = -1;
+String lastMusicResult = "MP3 not initialized.";
+
+const int MP3_MIN_INDEX = 0;
+const int MP3_MAX_INDEX = 40;
+// Most DFPlayer-compatible modules play the first sorted file with play(1).
+// With files 00.mp3, 01.mp3..., index 0 usually maps to play(1).
+// If your module is off by one, change this to 0.
+const int MP3_TRACK_OFFSET = 1;
+
 // ====================== Function declarations ======================
 void connectWiFi();
 void syncTime();
 void updateTime();
 bool readHuman();
+bool isHumanPresent();
+void scanI2CBus();
+String scanI2CBusText();
+void initEnvironmentSensors();
+void readEnvironmentSensors();
+void updateAutoEnvironmentControl();
+String formatEnvValue(float value, int decimals, const char* suffix);
 void checkReminder();
 void updateOLED();
 void handleBuzzerAndLED();
@@ -163,6 +222,10 @@ void handleAutoVoice();
 void initI2SMic();
 void initI2SSpeaker();
 void playSpeakerTone(uint16_t frequency, uint16_t durationMs);
+void initMP3Player();
+void mp3SendCommand(uint8_t command, uint16_t parameter);
+bool playMp3Index(int index);
+bool handleMusicAction(String action, int value, String &message);
 void setFan(bool on);
 void setLamp(bool on);
 void setAllDevices(bool on);
@@ -181,6 +244,9 @@ void handleFanOff();
 void handleLampOn();
 void handleLampOff();
 void handleAllOff();
+void handleAutoEnvOn();
+void handleAutoEnvOff();
+void handleI2CScan();
 
 void createTestTask();
 void createTask(String title, time_t remindEpoch);
@@ -203,7 +269,7 @@ void writeWavHeader(uint8_t* wav, uint32_t pcmLen);
 uint8_t* recordWav();
 bool createTaskFromAIJson(String responseBody, String &message);
 bool uploadVoiceAndCreateTask(uint8_t* wav, String &message);
-bool handleControlAction(String action, String &message);
+bool handleControlAction(String action, int value, String &message);
 
 
 // ====================== setup ======================
@@ -245,11 +311,14 @@ void setup() {
     Serial.println("OLED init failed. Check wiring and I2C address.");
   }
 
+  initEnvironmentSensors();
+
   connectWiFi();
   setupWebServer();
   syncTime();
   initI2SMic();
   initI2SSpeaker();
+  initMP3Player();
 
   updateTime();
 
@@ -270,8 +339,11 @@ void loop() {
   humanLast = humanNow;
   humanNow = readHuman();
 
+  readEnvironmentSensors();
+
   handleButton();
   checkReminder();
+  updateAutoEnvironmentControl();
   handleBuzzerAndLED();
 
   unsigned long nowMs = millis();
@@ -427,6 +499,185 @@ void updateTime() {
 bool readHuman() {
   int raw = digitalRead(PIN_HUMAN);
   return raw == HUMAN_ACTIVE_LEVEL;
+}
+
+bool isHumanPresent() {
+  return humanNow;
+}
+
+void scanI2CBus() {
+  Serial.println("Scanning I2C bus...");
+  int count = 0;
+
+  for (uint8_t address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    uint8_t error = Wire.endTransmission();
+
+    if (error == 0) {
+      Serial.print("I2C device found at 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+      count++;
+    }
+  }
+
+  Serial.print("I2C scan done. Count=");
+  Serial.println(count);
+}
+
+String scanI2CBusText() {
+  String result = "I2C devices:\n";
+  int count = 0;
+
+  for (uint8_t address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    uint8_t error = Wire.endTransmission();
+
+    if (error == 0) {
+      if (address < 16) result += "0x0";
+      else result += "0x";
+      result += String(address, HEX);
+      result += "\n";
+      count++;
+    }
+  }
+
+  result += "Count=";
+  result += String(count);
+  result += "\n";
+  return result;
+}
+
+void initEnvironmentSensors() {
+  scanI2CBus();
+
+  Serial.println("Init BH1750...");
+  bh1750OK = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
+  if (!bh1750OK) {
+    Serial.println("BH1750 0x23 failed, trying 0x5C...");
+    bh1750OK = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x5C, &Wire);
+  }
+  Serial.println(bh1750OK ? "BH1750 OK" : "BH1750 NOT FOUND");
+
+  Serial.println("Init AHT20...");
+  aht20OK = aht.begin(&Wire);
+  Serial.println(aht20OK ? "AHT20 OK" : "AHT20 NOT FOUND");
+
+  Serial.println("Init BMP280...");
+  bmp280OK = bmp.begin(0x76);
+  if (!bmp280OK) {
+    Serial.println("BMP280 0x76 failed, trying 0x77...");
+    bmp280OK = bmp.begin(0x77);
+  }
+  Serial.println(bmp280OK ? "BMP280 OK" : "BMP280 NOT FOUND");
+}
+
+void readEnvironmentSensors() {
+  unsigned long nowMs = millis();
+  if (lastEnvReadMs != 0 && nowMs - lastEnvReadMs < ENV_READ_INTERVAL_MS) {
+    return;
+  }
+  lastEnvReadMs = nowMs;
+
+  if (bh1750OK) {
+    float lux = lightMeter.readLightLevel();
+    if (!isnan(lux) && lux >= 0) {
+      envLux = lux;
+    }
+  }
+
+  if (aht20OK) {
+    sensors_event_t humidity;
+    sensors_event_t temp;
+    aht.getEvent(&humidity, &temp);
+    if (!isnan(temp.temperature)) {
+      envTempC = temp.temperature;
+    }
+    if (!isnan(humidity.relative_humidity)) {
+      envHumidity = humidity.relative_humidity;
+    }
+  }
+
+  if (bmp280OK) {
+    float pressure = bmp.readPressure() / 100.0F;
+    if (!isnan(pressure) && pressure > 0) {
+      envPressureHpa = pressure;
+    }
+    if (!aht20OK) {
+      float bmpTemp = bmp.readTemperature();
+      if (!isnan(bmpTemp)) {
+        envTempC = bmpTemp;
+      }
+    }
+  }
+
+  Serial.print("ENV temp=");
+  if (isnan(envTempC)) Serial.print("N/A"); else Serial.print(envTempC, 1);
+
+  Serial.print(" hum=");
+  if (isnan(envHumidity)) Serial.print("N/A"); else Serial.print(envHumidity, 1);
+
+  Serial.print(" lux=");
+  if (isnan(envLux)) Serial.print("N/A"); else Serial.print(envLux, 1);
+
+  Serial.print(" pressure=");
+  if (isnan(envPressureHpa)) Serial.println("N/A"); else Serial.println(envPressureHpa, 1);
+}
+
+void updateAutoEnvironmentControl() {
+  if (!autoEnvMode) {
+    return;
+  }
+
+  if (currentTask.active && currentTask.state == TASK_ALERTING) {
+    return;
+  }
+
+  bool human = isHumanPresent();
+
+  if (human) {
+    lastHumanAbsentMs = 0;
+
+    if (!isnan(envTempC)) {
+      if (envTempC >= FAN_ON_TEMP_C && !fanOn) {
+        setFan(true);
+        Serial.print("Auto: human=1 temp=");
+        Serial.print(envTempC, 1);
+        Serial.println(" -> Fan ON");
+      } else if (envTempC <= FAN_OFF_TEMP_C && fanOn) {
+        setFan(false);
+        Serial.print("Auto: human=1 temp=");
+        Serial.print(envTempC, 1);
+        Serial.println(" -> Fan OFF");
+      }
+    }
+
+    if (!isnan(envLux)) {
+      if (envLux <= LAMP_ON_LUX && !lampOn) {
+        setLamp(true);
+        Serial.print("Auto: human=1 lux=");
+        Serial.print(envLux, 1);
+        Serial.println(" -> Lamp ON");
+      } else if (envLux >= LAMP_OFF_LUX && lampOn) {
+        setLamp(false);
+        Serial.print("Auto: human=1 lux=");
+        Serial.print(envLux, 1);
+        Serial.println(" -> Lamp OFF");
+      }
+    }
+  } else {
+    if (lastHumanAbsentMs == 0) {
+      lastHumanAbsentMs = millis();
+    }
+
+    if (millis() - lastHumanAbsentMs >= AUTO_OFF_DELAY_MS) {
+      if (fanOn || lampOn) {
+        setFan(false);
+        setLamp(false);
+        Serial.println("Auto: human=0 timeout -> Fan/Lamp OFF");
+      }
+    }
+  }
 }
 
 void setFan(bool on) {
@@ -715,6 +966,120 @@ void initI2SSpeaker() {
   Serial.println(PIN_SPK_DOUT);
 }
 
+void initMP3Player() {
+  Serial.println("Init MP3-TF-16P serial control...");
+  mp3Serial.begin(9600, SERIAL_8N1, PIN_MP3_RX, PIN_MP3_TX);
+  delay(500);
+
+  mp3OK = true;
+  mp3SendCommand(0x06, mp3Volume);  // Set volume, range 0..30.
+  lastMusicResult = "MP3 serial ready. volume=" + String(mp3Volume);
+  Serial.println(lastMusicResult);
+
+  Serial.print("MP3 pins: TX=");
+  Serial.print(PIN_MP3_TX);
+  Serial.print(" RX=");
+  Serial.println(PIN_MP3_RX);
+}
+
+void mp3SendCommand(uint8_t command, uint16_t parameter) {
+  uint8_t frame[10] = {
+    0x7E, 0xFF, 0x06, command, 0x00,
+    (uint8_t)(parameter >> 8),
+    (uint8_t)(parameter & 0xFF),
+    0x00, 0x00, 0xEF
+  };
+
+  uint16_t sum = 0;
+  for (int i = 1; i <= 6; i++) {
+    sum += frame[i];
+  }
+  uint16_t checksum = 0 - sum;
+  frame[7] = (uint8_t)(checksum >> 8);
+  frame[8] = (uint8_t)(checksum & 0xFF);
+
+  mp3Serial.write(frame, sizeof(frame));
+  mp3Serial.flush();
+}
+
+bool playMp3Index(int index) {
+  if (!mp3OK) {
+    lastMusicResult = "MP3 not ready.";
+    Serial.println(lastMusicResult);
+    return false;
+  }
+
+  if (index < MP3_MIN_INDEX || index > MP3_MAX_INDEX) {
+    lastMusicResult = "MP3 index out of range: " + String(index);
+    Serial.println(lastMusicResult);
+    return false;
+  }
+
+  int trackNumber = index + MP3_TRACK_OFFSET;
+  mp3SendCommand(0x03, trackNumber);
+  currentMp3Index = index;
+
+  char fileName[16];
+  snprintf(fileName, sizeof(fileName), "%02d.mp3", index);
+  lastMusicResult = "Playing " + String(fileName) + " track=" + String(trackNumber);
+  Serial.println(lastMusicResult);
+  return true;
+}
+
+bool handleMusicAction(String action, int value, String &message) {
+  if (!mp3OK) {
+    message = "MP3 not ready. Check wiring/TF card.";
+    lastMusicResult = message;
+    Serial.println(message);
+    return false;
+  }
+
+  if (action == "music_play_index") {
+    if (!playMp3Index(value)) {
+      message = lastMusicResult;
+      return false;
+    }
+    message = lastMusicResult;
+    return true;
+  }
+
+  if (action == "music_play") {
+    mp3SendCommand(0x0D, 0);
+    lastMusicResult = "Music play/resume.";
+  } else if (action == "music_pause") {
+    mp3SendCommand(0x0E, 0);
+    lastMusicResult = "Music paused.";
+  } else if (action == "music_next") {
+    mp3SendCommand(0x01, 0);
+    currentMp3Index = -1;
+    lastMusicResult = "Music next.";
+  } else if (action == "music_prev") {
+    mp3SendCommand(0x02, 0);
+    currentMp3Index = -1;
+    lastMusicResult = "Music previous.";
+  } else if (action == "music_volume_up") {
+    if (mp3Volume < 30) mp3Volume++;
+    mp3SendCommand(0x06, mp3Volume);
+    lastMusicResult = "Music volume=" + String(mp3Volume);
+  } else if (action == "music_volume_down") {
+    if (mp3Volume > 0) mp3Volume--;
+    mp3SendCommand(0x06, mp3Volume);
+    lastMusicResult = "Music volume=" + String(mp3Volume);
+  } else if (action == "music_volume_set") {
+    if (value < 0) value = 0;
+    if (value > 30) value = 30;
+    mp3Volume = value;
+    mp3SendCommand(0x06, mp3Volume);
+    lastMusicResult = "Music volume=" + String(mp3Volume);
+  } else {
+    message = "Unknown music action: " + action;
+    return false;
+  }
+
+  message = lastMusicResult;
+  Serial.println(lastMusicResult);
+  return true;
+}
 void playSpeakerTone(uint16_t frequency, uint16_t durationMs) {
   if (!speakerOK || frequency == 0 || durationMs == 0) {
     return;
@@ -884,25 +1249,21 @@ uint8_t* recordWav() {
   return wav;
 }
 
-bool handleControlAction(String action, String &message) {
+bool handleControlAction(String action, int value, String &message) {
   action.trim();
 
+  if (action.startsWith("music_")) {
+    bool ok = handleMusicAction(action, value, message);
+    if (ok) {
+      lastAIResult = message;
+    }
+    return ok;
+  }
+
   if (action == "fan_on") {
-    fanOn = true;
-    pinMode(FAN_PIN, OUTPUT);
-    digitalWrite(FAN_PIN, HIGH);
-    Serial.print("Fan: ON direct GPIO");
-    Serial.print(FAN_PIN);
-    Serial.print(" level=");
-    Serial.println(digitalRead(FAN_PIN));
+    setFan(true);
   } else if (action == "fan_off") {
-    fanOn = false;
-    pinMode(FAN_PIN, OUTPUT);
-    digitalWrite(FAN_PIN, LOW);
-    Serial.print("Fan: OFF direct GPIO");
-    Serial.print(FAN_PIN);
-    Serial.print(" level=");
-    Serial.println(digitalRead(FAN_PIN));
+    setFan(false);
   } else if (action == "lamp_on") {
     setLamp(true);
   } else if (action == "lamp_off") {
@@ -944,10 +1305,14 @@ bool createTaskFromAIJson(String responseBody, String &message) {
   String resultType = doc["type"] | "";
   if (resultType == "control") {
     String action = doc["action"] | "";
+    int actionValue = doc["song_index"] | -1;
+    if (actionValue < 0) {
+      actionValue = doc["volume"] | -1;
+    }
     if (asrText.length() > 0) {
       Serial.println("ASR: " + asrText);
     }
-    return handleControlAction(action, message);
+    return handleControlAction(action, actionValue, message);
   }
 
   String title = doc["title"] | "Voice Task";
@@ -1044,6 +1409,23 @@ void updateOLED() {
   display.print("Human: ");
   display.println(humanNow ? "YES" : "NO");
 
+  if (!currentTask.active || currentTask.state == TASK_DONE) {
+    display.print("Temp: ");
+    display.println(formatEnvValue(envTempC, 1, "C"));
+
+    display.print("Hum: ");
+    display.println(formatEnvValue(envHumidity, 0, "%"));
+
+    display.print("Lux: ");
+    display.println(formatEnvValue(envLux, 0, ""));
+
+    display.print("Auto: ");
+    display.println(autoEnvMode ? "ON" : "OFF");
+
+    display.display();
+    return;
+  }
+
   display.print("Voice: ");
   display.println(voiceBusy ? "LISTEN" : lastVoiceResult.substring(0, 14));
 
@@ -1082,11 +1464,16 @@ void setupWebServer() {
   server.on("/lamp_on", HTTP_POST, handleLampOn);
   server.on("/lamp_off", HTTP_POST, handleLampOff);
   server.on("/all_off", HTTP_POST, handleAllOff);
+  server.on("/auto_env_on", HTTP_POST, handleAutoEnvOn);
+  server.on("/auto_env_off", HTTP_POST, handleAutoEnvOff);
+  server.on("/i2c_scan", HTTP_GET, handleI2CScan);
   server.on("/fan_on", HTTP_GET, handleFanOn);
   server.on("/fan_off", HTTP_GET, handleFanOff);
   server.on("/lamp_on", HTTP_GET, handleLampOn);
   server.on("/lamp_off", HTTP_GET, handleLampOff);
   server.on("/all_off", HTTP_GET, handleAllOff);
+  server.on("/auto_env_on", HTTP_GET, handleAutoEnvOn);
+  server.on("/auto_env_off", HTTP_GET, handleAutoEnvOff);
 
   server.onNotFound([]() {
     server.send(404, "text/plain", "404 Not Found");
@@ -1140,8 +1527,10 @@ void handleRoot() {
   html += "<p><b>Voice Peak:</b> " + String(lastVoicePeak) + "</p>";
   html += "<p><b>Voice RMS:</b> " + String(lastVoiceRms) + "</p>";
   html += "<p><b>Speaker:</b> " + htmlEscape(lastSpeakerResult) + "</p>";
+  html += "<p><b>Music:</b> " + htmlEscape(lastMusicResult) + "</p>";
   html += "<p><b>Fan:</b> " + String(fanOn ? "ON" : "OFF") + "</p>";
   html += "<p><b>Lamp:</b> " + String(lampOn ? "ON" : "OFF") + "</p>";
+  html += "<p><b>Auto Env Mode:</b> " + String(autoEnvMode ? "ON" : "OFF") + "</p>";
 
   if (WiFi.status() == WL_CONNECTED) {
     html += "<p><b>IP:</b> " + WiFi.localIP().toString() + "</p>";
@@ -1189,6 +1578,28 @@ void handleRoot() {
   html += "<button class='gray' type='submit'>Test Speaker Tone</button>";
   html += "</form>";
   html += "<p class='muted'>BCLK=GPIO16, LRC=GPIO17, DIN=GPIO18.</p>";
+  html += "</div>";
+
+  html += "<div class='card'>";
+  html += "<h3>Environment</h3>";
+  html += "<p><b>Auto Mode:</b> " + String(autoEnvMode ? "ON" : "OFF") + "</p>";
+  html += "<p><b>Temp:</b> " + htmlEscape(formatEnvValue(envTempC, 1, " C")) + "</p>";
+  html += "<p><b>Humidity:</b> " + htmlEscape(formatEnvValue(envHumidity, 1, " %")) + "</p>";
+  html += "<p><b>Lux:</b> " + htmlEscape(formatEnvValue(envLux, 1, " lx")) + "</p>";
+  html += "<p><b>Pressure:</b> " + htmlEscape(formatEnvValue(envPressureHpa, 1, " hPa")) + "</p>";
+  html += "<p><b>BH1750:</b> " + String(bh1750OK ? "OK" : "NOT FOUND") + "</p>";
+  html += "<p><b>AHT20:</b> " + String(aht20OK ? "OK" : "NOT FOUND") + "</p>";
+  html += "<p><b>BMP280:</b> " + String(bmp280OK ? "OK" : "NOT FOUND") + "</p>";
+  html += "<form action='/auto_env_on' method='POST'>";
+  html += "<button class='ok' type='submit'>Auto Mode ON</button>";
+  html += "</form>";
+  html += "<form action='/auto_env_off' method='POST'>";
+  html += "<button class='gray' type='submit'>Auto Mode OFF</button>";
+  html += "</form>";
+  html += "<form action='/i2c_scan' method='GET'>";
+  html += "<button class='warn' type='submit'>I2C Scan</button>";
+  html += "</form>";
+  html += "<p class='muted'>I2C bus: SDA=GPIO8, SCL=GPIO9. Sensor VCC must use 3V3.</p>";
   html += "</div>";
 
   html += "<div class='card'>";
@@ -1332,26 +1743,14 @@ void handleSpeakerTest() {
 }
 
 void handleFanOn() {
-  fanOn = true;
-  pinMode(FAN_PIN, OUTPUT);
-  digitalWrite(FAN_PIN, HIGH);
-  Serial.print("Fan: ON direct GPIO");
-  Serial.print(FAN_PIN);
-  Serial.print(" level=");
-  Serial.println(digitalRead(FAN_PIN));
+  setFan(true);
   lastAIResult = "Fan ON";
   redirectRoot();
 }
 
 
 void handleFanOff() {
-  fanOn = false;
-  pinMode(FAN_PIN, OUTPUT);
-  digitalWrite(FAN_PIN, LOW);
-  Serial.print("Fan: OFF direct GPIO");
-  Serial.print(FAN_PIN);
-  Serial.print(" level=");
-  Serial.println(digitalRead(FAN_PIN));
+  setFan(false);
   lastAIResult = "Fan OFF";
   redirectRoot();
 }
@@ -1375,6 +1774,27 @@ void handleAllOff() {
   setAllDevices(false);
   lastAIResult = "All devices OFF";
   redirectRoot();
+}
+
+void handleAutoEnvOn() {
+  autoEnvMode = true;
+  lastHumanAbsentMs = 0;
+  lastAIResult = "Auto environment mode ON";
+  Serial.println("Auto Mode ON");
+  redirectRoot();
+}
+
+void handleAutoEnvOff() {
+  autoEnvMode = false;
+  lastAIResult = "Auto environment mode OFF";
+  Serial.println("Auto Mode OFF");
+  redirectRoot();
+}
+
+void handleI2CScan() {
+  String body = scanI2CBusText();
+  Serial.print(body);
+  server.send(200, "text/plain", body);
 }
 
 
@@ -1474,8 +1894,12 @@ void handleAIParse() {
   String resultType = respDoc["type"] | "";
   if (resultType == "control") {
     String action = respDoc["action"] | "";
+    int actionValue = respDoc["song_index"] | -1;
+    if (actionValue < 0) {
+      actionValue = respDoc["volume"] | -1;
+    }
     String message;
-    if (!handleControlAction(action, message)) {
+    if (!handleControlAction(action, actionValue, message)) {
       lastAIResult = message;
     }
     redirectRoot();
@@ -1697,6 +2121,13 @@ String formatEpochHHMM(time_t epoch) {
 }
 
 
+String formatEnvValue(float value, int decimals, const char* suffix) {
+  if (isnan(value)) {
+    return "N/A";
+  }
+  return String(value, decimals) + String(suffix);
+}
+
 String htmlEscape(String s) {
   s.replace("&", "&amp;");
   s.replace("<", "&lt;");
@@ -1810,6 +2241,21 @@ void printDebug() {
   Serial.print(" | VoiceRMS=");
   Serial.print(lastVoiceRms);
 
+  Serial.print(" | AutoEnv=");
+  Serial.print(autoEnvMode ? "ON" : "OFF");
+
+  Serial.print(" | Temp=");
+  if (isnan(envTempC)) Serial.print("N/A"); else Serial.print(envTempC, 1);
+
+  Serial.print(" | Hum=");
+  if (isnan(envHumidity)) Serial.print("N/A"); else Serial.print(envHumidity, 1);
+
+  Serial.print(" | Lux=");
+  if (isnan(envLux)) Serial.print("N/A"); else Serial.print(envLux, 1);
+
+  Serial.print(" | Pressure=");
+  if (isnan(envPressureHpa)) Serial.print("N/A"); else Serial.print(envPressureHpa, 1);
+
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print(" | IP=");
     Serial.print(WiFi.localIP());
@@ -1819,3 +2265,14 @@ void printDebug() {
 
   Serial.println();
 }
+
+
+
+
+
+
+
+
+
+
+

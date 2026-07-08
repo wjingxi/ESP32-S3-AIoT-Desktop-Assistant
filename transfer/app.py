@@ -580,7 +580,109 @@ def deepseek_parse(text: str):
         return None
 
 
+
+
+def _parse_chinese_number_token(token: str):
+    token = token.strip()
+    if not token:
+        return None
+
+    digit_map = {
+        "\u96f6": 0, "\u3007": 0, "0": 0,
+        "\u4e00": 1, "\u58f9": 1, "1": 1,
+        "\u4e8c": 2, "\u4e24": 2, "\u8d30": 2, "2": 2,
+        "\u4e09": 3, "\u53c1": 3, "3": 3,
+        "\u56db": 4, "\u8086": 4, "4": 4,
+        "\u4e94": 5, "\u4f0d": 5, "5": 5,
+        "\u516d": 6, "\u9646": 6, "6": 6,
+        "\u4e03": 7, "\u67d2": 7, "7": 7,
+        "\u516b": 8, "\u634c": 8, "8": 8,
+        "\u4e5d": 9, "\u7396": 9, "9": 9,
+    }
+
+    if token.isdigit():
+        return int(token)
+
+    if all(ch in digit_map for ch in token):
+        value = 0
+        for ch in token:
+            value = value * 10 + digit_map[ch]
+        return value
+
+    ten = "\u5341"
+    if ten in token:
+        parts = token.split(ten)
+        if len(parts) != 2:
+            return None
+        left, right = parts
+        tens = 1 if left == "" else digit_map.get(left)
+        ones = 0 if right == "" else digit_map.get(right)
+        if tens is None or ones is None:
+            return None
+        return tens * 10 + ones
+
+    return None
+
+
+def parse_music_command(text: str):
+    import re
+    t = text.strip().replace(" ", "")
+    if not t:
+        return None
+
+    play_words = ["\u64ad\u653e", "\u653e", "\u542c"]
+    pause_words = ["\u6682\u505c", "\u505c\u6b62\u64ad\u653e", "\u505c\u4e00\u4e0b"]
+    next_words = ["\u4e0b\u4e00\u9996", "\u4e0b\u9996", "\u4e0b\u4e00\u66f2", "\u4e0b\u4e00\u4e2a"]
+    prev_words = ["\u4e0a\u4e00\u9996", "\u4e0a\u9996", "\u4e0a\u4e00\u66f2", "\u524d\u4e00\u9996"]
+    volume_words = ["\u97f3\u91cf", "\u58f0\u97f3"]
+
+    def has_any(words):
+        return any(w in t for w in words)
+
+    def result(action, title, **extra):
+        data = {"success": True, "type": "control", "source": "local_music_rule", "action": action, "title": title, "delay_seconds": -1, "remind_time": ""}
+        data.update(extra)
+        return data
+
+    if has_any(next_words):
+        return result("music_next", "next music")
+    if has_any(prev_words):
+        return result("music_prev", "previous music")
+    if has_any(pause_words):
+        return result("music_pause", "pause music")
+
+    if has_any(volume_words):
+        m = re.search(r"(\d{1,2})", t)
+        if m:
+            value = max(0, min(30, int(m.group(1))))
+            return result("music_volume_set", f"volume {value}", volume=value)
+        if any(w in t for w in ["\u5927", "\u52a0", "\u589e\u52a0", "\u8c03\u9ad8", "\u9ad8\u4e00\u70b9"]):
+            return result("music_volume_up", "volume up")
+        if any(w in t for w in ["\u5c0f", "\u51cf", "\u964d\u4f4e", "\u8c03\u4f4e", "\u4f4e\u4e00\u70b9"]):
+            return result("music_volume_down", "volume down")
+
+    if has_any(play_words):
+        number_chars = r"0-9\u96f6\u3007\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u58f9\u8d30\u53c1\u8086\u4f0d\u9646\u67d2\u634c\u7396"
+        patterns = [
+            rf"(?:\u64ad\u653e|\u653e|\u542c)(?:\u97f3\u4e50|\u6b4c\u66f2|\u6b4c)?\u7b2c?([{number_chars}]{{1,4}})(?:\u9996|\u66f2|\u4e2a|\u53f7|\u6b4c)?",
+            rf"\u7b2c([{number_chars}]{{1,4}})(?:\u9996|\u66f2|\u4e2a|\u53f7|\u6b4c)",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, t)
+            if m:
+                index = _parse_chinese_number_token(m.group(1))
+                if index is not None and 0 <= index <= 40:
+                    return result("music_play_index", f"play {index:02d}.mp3", song_index=index)
+        return result("music_play", "play music")
+
+    return None
+
+
 def parse_control_command(text: str):
+    music_result = parse_music_command(text)
+    if music_result is not None:
+        return music_result
+
     t = text.strip().replace(" ", "")
 
     fan_words = [
