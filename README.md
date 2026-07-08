@@ -1,156 +1,124 @@
-﻿# ESP32-S3 存在感知智能提醒终端
+# ESP32-S3 存在感知智能提醒终端
 
-本项目是一个基于 ESP32-S3 的智能提醒终端。目前只完成了初步阶段的项目，已完善的功能有ESP32-S3 负责网页交互、OLED 显示、提醒状态机、LD2410C 存在感知、蜂鸣器/LED/灯板/风扇控制、INMP441 硬件麦克风采样；电脑端 Python Flask 服务负责语音识别中转和 DeepSeek 自然语言解析。
+这是一个基于 ESP32-S3 的存在感知智能提醒终端。设备端使用 Arduino IDE 开发，负责网页控制、OLED 显示、提醒状态机、人体存在检测、环境采集、蜂鸣器/LED 提醒、风扇/灯带控制、硬件麦克风录音和 MP3 播放控制；电脑端 Python Flask 服务负责语音识别和自然语言解析。
 
+## 主要功能
 
-小组成员：王镜熹-2452851       潘程宇-2452853
-
+- 手动添加 HH:MM 定时提醒。
+- 网页 AI 文字输入和网页语音输入。
+- INMP441 硬件麦克风录音上传到 Python `/voice`。
+- Python 使用 faster-whisper 做语音识别。
+- Python `/parse_text` 支持 DeepSeek 解析，也支持本地规则解析控制命令。
+- 单任务提醒状态机：`WAITING` / `PENDING` / `ALERTING` / `DONE`。
+- LD2410C 人体存在感知。
+- OLED 显示时间、任务、状态和环境信息。
+- 蜂鸣器、LED、MAX98357A 提示音提醒。
+- 风扇和普通灯带/COB 灯板网页手动控制。
+- 风扇和灯带语音控制：打开/关闭风扇，打开/关闭灯带。
+- BH1750、AHT20、BMP280 环境数据显示。
+- Auto Env Mode：有人且温度高自动开风扇，有人且光照低自动开灯带，无人 10 秒自动关闭。
+- MP3-TF-16P 音乐控制，支持播放、暂停、上一首、下一首、音量调节和按编号播放。
 
 ## 目录结构
 
 ```text
-ESP32/
+ESP32_可运行调试版_含风扇台灯语音控制/
 ├─ Arduino_code/
-│  └─ AI.ino                 # Arduino IDE 主程序
+│  └─ code/
+│     └─ code.ino        # Arduino IDE 主程序
 ├─ transfer/
-│  ├─ app.py                 # Flask 中转服务：/parse_text、/voice、/last_voice.wav
-│  ├─ requirements.txt       # Python 依赖
-│  ├─ run_server.bat         # Windows 一键启动脚本
-│  └─ .env.example           # 环境变量示例，不包含真实密钥
-├─ .gitignore
+│  ├─ app.py             # Flask 服务：/parse_text、/voice、/health
+│  ├─ requirements.txt   # Python 依赖
+│  ├─ run_server.bat     # Windows 启动脚本
+│  └─ .env.example       # 环境变量示例
 ├─ README.md
-└─ 项目交接说明.md
+├─ 项目交接说明.md
+└─ 环境传感器调试说明.md
 ```
 
 ## 硬件引脚
 
-| 功能 | ESP32-S3 引脚 |
+| 模块 | ESP32-S3 引脚 |
 |---|---|
-| LED | GPIO5 |
-| 蜂鸣器 | GPIO4 |
-| LD2410C OUT | GPIO15 |
-| 确认按键 | GPIO6 |
 | OLED SDA | GPIO8 |
 | OLED SCL | GPIO9 |
-| INMP441 SCK/BCLK | GPIO10 |
-| INMP441 WS/LRCLK | GPIO11 |
-| INMP441 SD/DIN | GPIO12 |
-| 风扇 LR7843 PWM/IN | GPIO13 |
-| 灯板 LR7843 PWM/IN | GPIO14 |
+| 蜂鸣器 | GPIO4 |
+| LED | GPIO5 |
+| 确认按键 | GPIO6 |
+| INMP441 SCK | GPIO10 |
+| INMP441 WS | GPIO11 |
+| INMP441 SD | GPIO12 |
+| 风扇 LR7843 PWM | GPIO13 |
+| 灯带/COB 灯板 LR7843 PWM | GPIO14 |
+| LD2410C OUT | GPIO15 |
 | MAX98357A BCLK | GPIO16 |
-| MAX98357A LRC | GPIO17 |
+| MAX98357A LRC/LRCLK | GPIO17 |
 | MAX98357A DIN | GPIO18 |
+| MP3-TF-16P RX | ESP32 GPIO47 TX |
+| MP3-TF-16P TX | ESP32 GPIO48 RX |
 
-INMP441 默认按 `L/R -> GND` 使用左声道。风扇和灯板通过 LR7843 MOSFET 模块控制，默认高电平导通。
+BH1750、AHT20、BMP280 与 OLED 共用 I2C：`SDA -> GPIO8`，`SCL -> GPIO9`，电源接 `3V3` 和 `GND`。
 
-## Python 环境配置
+## 运行方式
 
-推荐 Python 3.10 或 3.11。首次运行前进入 `transfer` 目录：
+### 1. 启动 Python 服务
 
-```powershell
-cd transfer
-copy .env.example .env
-```
-
-编辑 `.env`，填入自己的 DeepSeek API Key：
-
-```env
-DEEPSEEK_API_KEY=your_deepseek_api_key_here
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-pro
-WHISPER_MODEL=tiny
-ASR_DEVICE=cpu
-ASR_COMPUTE_TYPE=int8
-```
-
-安装依赖并启动：
+进入 `transfer` 目录，按需复制 `.env.example` 为 `.env` 并填写 DeepSeek 配置，然后运行：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\activate
-python -m pip install -r requirements.txt
 python app.py
 ```
 
-也可以双击或运行：
+也可以直接运行：
 
 ```powershell
 run_server.bat
 ```
 
-服务启动后访问：
+常用接口：
+
+- `GET /health`：服务状态检查。
+- `POST /parse_text`：文字解析提醒或控制命令。
+- `POST /voice`：接收 ESP32 上传的 WAV 并识别解析。
+- `GET /last_voice.wav`：查看最近一次硬件麦克风录音。
+
+### 2. 烧录 Arduino 程序
+
+使用 Arduino IDE 打开：
 
 ```text
-http://127.0.0.1:5000/health
+Arduino_code/code/code.ino
 ```
 
-ESP32 上传的最近一次硬件麦克风录音可访问：
-
-```text
-http://电脑IP:5000/last_voice.wav
-```
-
-## Arduino IDE 烧录
-
-1. 打开 `Arduino_code/AI.ino`。
-2. 安装 ESP32 Arduino 开发板支持。
-3. 安装依赖库：
-   - ArduinoJson
-   - Adafruit GFX Library
-   - Adafruit SSD1306
-4. 选择开发板：`ESP32S3 Dev Module`。
-5. 在 `AI.ino` 顶部修改 Wi-Fi 名称、密码和 Python 服务地址：
+确认代码中的 Wi-Fi 和 Python 服务地址正确，例如：
 
 ```cpp
-const char* WIFI_SSID = "你的WiFi";
-const char* WIFI_PASS = "你的密码";
 const char* AI_PARSE_URL = "http://电脑IP:5000/parse_text";
 const char* AI_VOICE_URL = "http://电脑IP:5000/voice";
 ```
 
-6. 编译并上传到 ESP32-S3。
-7. 串口监视器波特率设为 `115200`，查看 ESP32 获取到的 IP。
+选择 ESP32-S3 开发板后编译上传，串口监视器波特率使用 `115200`。
 
-## 功能测试
+## MP3 说明
 
-### 1. 手动提醒
-
-打开 ESP32 网页，在 `Add Task` 输入标题和 HH:MM 时间，提交后到点提醒。
-
-### 2. AI 文字输入
-
-在网页 `AI / Web Voice Input` 输入：
+MP3-TF-16P 当前使用 GPIO47/48 直接串口协议控制，不依赖 `DFRobotDFPlayerMini` 库。TF 卡歌曲建议放在根目录，命名为：
 
 ```text
-五分钟后提醒我喝水
+00.mp3
+01.mp3
+02.mp3
+...
+40.mp3
 ```
 
-预期创建提醒任务。
+当前 `MP3_TRACK_OFFSET = 1`，即多数模块中 `play(1)` 对应 TF 卡排序第一首，也就是 `00.mp3`。如果实测“播放第0首”播成了 `01.mp3`，再把偏移改为 `0`。
 
-### 3. 网页语音输入
+## 注意事项
 
-点击 `Start Web Voice Input`，说出提醒或控制命令，识别成文字后点击 `Submit AI Parse`。
-
-### 4. 硬件麦克风
-
-点击 `Hardware Mic Record Once`，ESP32 录制 INMP441 音频并上传给 Python `/voice`，Python 使用 faster-whisper 识别后再解析。
-
-### 5. 风扇和灯板控制
-
-网页按钮：
-
-- `Fan ON / Fan OFF`
-- `Lamp ON / Lamp OFF`
-- `All OFF`
-
-AI/语音命令示例：
-
-```text
-打开风扇
-关闭风扇
-打开台灯
-关闭台灯
-打开灯带
-关闭灯带
-```
-
+- 本项目是 Arduino IDE 项目，不是 ESP-IDF 项目。
+- 不要随意改动已稳定的 GPIO 分配。
+- 传感器初始化失败不应卡死；未接传感器时网页显示 `N/A` 或 `NOT FOUND`。
+- 自动环境模式只通过网页按钮开启/关闭，不接入语音控制。
+- 普通灯带/COB 灯板不是 RGB 灯环，不使用 NeoPixel。
+- MP3 音乐从 MP3-TF-16P 自己的音频输出播放；MAX98357A 是 ESP32 的 I2S 提示音功放。
+- `transfer/.env` 可能包含 API Key，不要提交到公开仓库。
